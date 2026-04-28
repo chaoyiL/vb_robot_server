@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# 若 conda 环境中有 FFmpeg/libstdc++，优先让依赖从该环境加载动态库。
+if [[ -n "$CONDA_PREFIX" ]]; then
+    CONDA_LIB="$CONDA_PREFIX/lib"
+    if [[ -d "$CONDA_LIB" ]]; then
+        export LD_LIBRARY_PATH="$CONDA_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
+fi
+
+cd "$PROJECT_ROOT"
+uv run python Data_collection/check_data_quality/replay_using_quest_pose.py "$@"
