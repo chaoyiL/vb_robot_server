@@ -1,23 +1,15 @@
 #!/usr/bin/env bash
-# 运行 convert_zarr_to_lerobot.py
-# PyAV/LeRobot 需要 FFmpeg 6.x (libavformat.so.61)，系统默认 FFmpeg 4.x 不兼容。
-# 此脚本会优先使用 conda 环境中的 FFmpeg（若已安装）。
-#
-# 使用前请确保：
-#   方案 A（推荐）：在 conda 环境中安装 FFmpeg 6.x
-#     conda install -c conda-forge ffmpeg
-#   方案 B：系统安装 FFmpeg 6.x
-#     bash install_sys_deps.sh
-
+# 运行 convert_zarr_to_lerobot_smooth.py（PyAV 等建议配合 conda 中的 FFmpeg / libstdc++）。
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# 若 conda 环境中有 FFmpeg，让 PyAV 能找到 libavformat.so
+# 若 conda 环境中有 FFmpeg/libstdc++，优先让 PyAV 等依赖从该环境加载动态库，
+# 避免系统库版本过低导致 CXXABI 或 av 相关导入失败。
 if [[ -n "$CONDA_PREFIX" ]]; then
     CONDA_LIB="$CONDA_PREFIX/lib"
-    if [[ -d "$CONDA_LIB" ]] && ls "$CONDA_LIB"/libavformat.so* 1>/dev/null 2>&1; then
+    if [[ -d "$CONDA_LIB" ]]; then
         export LD_LIBRARY_PATH="$CONDA_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     fi
 fi
