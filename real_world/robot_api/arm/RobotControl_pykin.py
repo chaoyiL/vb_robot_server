@@ -1,315 +1,471 @@
-import sys
+"""
+RobotControl_pykin.py
+---------------------
+AM2 双臂机械臂的运动学控制层。
+
+设计 (方案 A):
+    - URDF 已拆成左右两个单臂文件, 每个的根都是 base_link
+    - pykin SingleArm 加载时不传 ab2rb 偏移 (Transform 用单位变换)
+    - setup_link_name("base_link", "left-link_tcp"), 让 IK/FK 链
+      从 URDF 根开始, 自动包含 JOINT_L00 的肩部偏移
+    - 结果: FK 输出 = ^rbT_eef, IK 输入 = ^rbT_eef, 完全自洽
+
+接口:
+    - get_robot_joints() -> dict
+    - get_ee_pose()      -> dict, ^rbT_eef 形式 (7-vector wxyz)
+    - set_target_JP(...)
+    - set_target_CP(target_pose, single_arm_mode=False)
+    - execute()
+    - stop()
+
+EE 位姿格式 (与旧版兼容):
+    7-vector [x, y, z, qw, qx, qy, qz]  (scalar-first 四元数)
+
+可配置项 (优先级: 显式参数 > YAML > 默认值):
+    - urdf_path_left/right
+    - base_link_left/right (默认 "base_link")
+    - ee_link_left/right (默认 "left-link_tcp" / "right-link_tcp")
+    - robot_type ("typhon" | "eyou")
+"""
+
 import os
-from time import time
+import sys
+import io
+import re
+import time
+import shutil
+import tempfile
+import contextlib
 from pathlib import Path
-dir = os.getcwd()
-sys.path.append(dir)
+
+# 让 `python real_world/.../RobotControl_pykin.py` 直接跑也能解析包路径
+# 把仓库根加到 sys.path
+_REPO_ROOT_FOR_IMPORT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT_FOR_IMPORT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT_FOR_IMPORT))
 
 import numpy as np
-import time
-import io
-import contextlib
+import yaml
+import xml.etree.ElementTree as ET
 
-from real_world.robot_api.arm.RobotWrapper import RobotWrapper
-from utils.pose_util import pose_to_mat, mat_to_pose
-# 修复 Python 3.10+ 中 collections.Iterable 的兼容性问题
 import collections
 import collections.abc
-# 为了兼容旧版本的库，需要将 collections.abc.Iterable 添加到 collections 模块
-if not hasattr(collections, 'Iterable'):
+if not hasattr(collections, "Iterable"):
     collections.Iterable = collections.abc.Iterable
 
+import transforms3d as t3d
+import pykin
 from pykin.robots.single_arm import SingleArm
-from pykin.robots.robot import Robot
 from pykin.kinematics import transform as t_utils
 
-import transforms3d as t3d
-import tempfile
-import re
-import shutil
-import pykin
+from real_world.robot_api.arm.RobotWrapper_typhon import RobotWrapperTyphon
+
+# 旧 backend 是 optional 的 (eyou 用 rb_python)
+try:
+    from real_world.robot_api.arm.RobotWrapper import RobotWrapper as RobotWrapperEyou
+    EYOU_AVAILABLE = True
+except ImportError:
+    EYOU_AVAILABLE = False
+
 
 MODULE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = MODULE_DIR.parents[2]
 
 
+# ============================================================
+# Helpers
+# ============================================================
 def _resolve_repo_path(path_like: str) -> str:
-    """Resolve a repo-relative path to an absolute path."""
-    path = Path(path_like)
-    if path.is_absolute():
-        return str(path)
-    return str((REPO_ROOT / path).resolve())
+    p = Path(path_like)
+    return str(p) if p.is_absolute() else str((REPO_ROOT / p).resolve())
+
+
+def _load_yaml_config(config_path: str) -> dict:
+    p = Path(config_path)
+    if not p.is_absolute():
+        p = REPO_ROOT / p
+    if not p.exists():
+        return {}
+    with open(p, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
 
 
 def preprocess_urdf(urdf_path: str) -> str:
-    """
-    Preprocess URDF file to replace ROS package:// URIs with relative paths.
-    Returns path to the preprocessed URDF file (temporary file).
-    """
-    # Read the original URDF
-    with open(urdf_path, 'r') as f:
-        urdf_content = f.read()
-    
-    # Get the directory containing the URDF
+    """把 ROS package:// URI 替换成相对路径, 写到临时文件返回路径"""
+    with open(urdf_path, "r") as f:
+        content = f.read()
     urdf_dir = os.path.dirname(os.path.abspath(urdf_path))
-    # Get the parent directory (where meshes/ folder is located)
     parent_dir = os.path.dirname(urdf_dir)
-    
-    # Extract package name from path (e.g., ARM-LEFT-GR-0 or ARM-RIGHT-GR-0)
-    # The package name is typically the directory name containing the urdf folder
     package_name = os.path.basename(parent_dir)
-    
-    # Replace all package://PACKAGE_NAME/ references with relative paths
-    # Since meshes/ and other resources are at the same level as urdf/, use ../
-    escaped_package_name = re.escape(package_name)
-    # Replace package://PACKAGE_NAME/ with ../ (relative to urdf/ directory)
-    urdf_content = re.sub(f'package://{escaped_package_name}/', '../', urdf_content)
-    
-    # Create a temporary file for the preprocessed URDF
-    temp_fd, temp_path = tempfile.mkstemp(suffix='.urdf', prefix='preprocessed_', dir=urdf_dir)
+    content = re.sub(f"package://{re.escape(package_name)}/", "../", content)
+    fd, tmp_path = tempfile.mkstemp(suffix=".urdf", prefix="preprocessed_",
+                                    dir=urdf_dir)
     try:
-        with os.fdopen(temp_fd, 'w') as f:
-            f.write(urdf_content)
-        return temp_path
-    except Exception as e:
-        os.close(temp_fd)
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        raise e
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        return tmp_path
+    except Exception:
+        os.close(fd)
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
 
 
 def prepare_urdf_for_pykin(urdf_path: str) -> tuple[str, str]:
     """
-    Prepare URDF for pykin and return:
-    1) path relative to pykin/assets (for SingleArm input)
-    2) temp file absolute path (for cleanup)
+    pykin 要求 URDF 在它的 assets 目录下 (它内部用相对路径加载 mesh)
+    这里 symlink 整个 package 到 pykin/assets/vb_vla_assets/, 然后预处理.
+    返回 (相对 pykin/assets 的路径, 临时文件绝对路径)
     """
-    src_urdf = Path(urdf_path).resolve()
-    package_dir = src_urdf.parent.parent
-    package_name = package_dir.name
+    src = Path(urdf_path).resolve()
+    pkg_dir = src.parent.parent
+    pkg_name = pkg_dir.name
 
-    pykin_assets_dir = Path(pykin.__file__).resolve().parent / "assets"
-    stage_root = pykin_assets_dir / "vb_vla_assets"
-    stage_pkg_dir = stage_root / package_name
-    stage_urdf = stage_pkg_dir / "urdf" / src_urdf.name
+    pykin_assets = Path(pykin.__file__).resolve().parent / "assets"
+    stage_root = pykin_assets / "vb_vla_assets"
+    stage_pkg = stage_root / pkg_name
+    stage_urdf = stage_pkg / "urdf" / src.name
 
     stage_root.mkdir(parents=True, exist_ok=True)
-    if not stage_pkg_dir.exists():
+    if not stage_pkg.exists():
         try:
-            # Prefer symlink to avoid copying heavy mesh files.
-            stage_pkg_dir.symlink_to(package_dir, target_is_directory=True)
+            stage_pkg.symlink_to(pkg_dir, target_is_directory=True)
         except OSError:
-            shutil.copytree(package_dir, stage_pkg_dir)
+            shutil.copytree(pkg_dir, stage_pkg)
 
     if not stage_urdf.exists():
-        raise FileNotFoundError(f"Staged URDF not found: {stage_urdf}")
+        raise FileNotFoundError(f"URDF not staged: {stage_urdf}")
 
-    preprocessed_abs = Path(preprocess_urdf(str(stage_urdf))).resolve()
+    preprocessed = Path(preprocess_urdf(str(stage_urdf))).resolve()
     try:
-        rel_to_pykin_assets = str(preprocessed_abs.relative_to(pykin_assets_dir))
+        rel = str(preprocessed.relative_to(pykin_assets))
     except ValueError:
-        # If stage_pkg_dir is a symlink, the temp URDF may resolve outside pykin/assets.
-        # pykin still accepts a relative path containing ".." segments.
-        rel_to_pykin_assets = os.path.relpath(str(preprocessed_abs), str(pykin_assets_dir))
-    return rel_to_pykin_assets, str(preprocessed_abs)
+        rel = os.path.relpath(str(preprocessed), str(pykin_assets))
+    return rel, str(preprocessed)
 
 
-def pos_orn_to_mat(position : list[float, float, float], quaternion : list[float, float, float, float]) -> np.ndarray:
-    # Create rotation matrix from quaternion
-
-    rotation_matrix = t3d.quaternions.quat2mat(quaternion)
-    
-    # Create 4x4 transformation matrix
-    matrix = np.eye(4)
-    matrix[:3, :3] = rotation_matrix
-    matrix[:3, 3] = position
-    
-    return matrix
-
-def mat_to_pos_orn(matrix : np.ndarray) -> tuple[list[float, float, float], list[float, float, float, float]]:
-    # Extract position
-    position = matrix[:3, 3]
-    
-    # Extract rotation matrix and convert to quaternion
-    rotation_matrix = matrix[:3, :3]
-    quaternion = t3d.quaternions.mat2quat(rotation_matrix)  # x, y, z, w format
-
-    return position, quaternion
-
+# ============================================================
+# RobotControl
+# ============================================================
 class RobotControl:
-    def __init__(self,
-    vel_max: float = None,
-    urdf_path_left = "assets/ARM-LEFT-GR-0/urdf/ARM-LEFT-GR-0.urdf",
-    urdf_path_right = "assets/ARM-RIGHT-GR-0/urdf/ARM-RIGHT-GR-0.urdf"
+    """
+    AM2 双臂机械臂运动学控制层.
+
+    Args:
+        vel_max: 关节最大速度 (typhon 下未使用, 保留是为兼容旧接口)
+        urdf_path_left/right: 单臂 URDF 路径 (拆分后的)
+        base_link_left/right: pykin IK/FK 链的根 link 名 (方案 A 推荐 'base_link')
+        ee_link_left/right: pykin IK/FK 链的末端 link 名 (推荐 'left-link_tcp')
+        robot_type: 'typhon' (AM2) 或 'eyou' (旧机械臂)
+        config_path: YAML 配置, 用来集中管理上面这些参数
+        robot_wrapper: 直接注入的 wrapper 实例 (覆盖 robot_type)
+    """
+
+    def __init__(
+        self,
+        vel_max: float = None,
+        urdf_path_left: str = None,
+        urdf_path_right: str = None,
+        base_link_left: str = "base_link",
+        base_link_right: str = "base_link",
+        ee_link_left: str = "left-link_arm_7",
+        ee_link_right: str = "right-link_arm_7",
+        robot_type: str = "typhon",
+        config_path: str = "configs/am2.yaml",
+        robot_wrapper=None,
+        left_joint_names: list[str] | None = None,
+        right_joint_names: list[str] | None = None,
     ):
-        # class for robot control
-        self.robot = RobotWrapper(vel_max=vel_max)
+        # ── 加载配置 ──
+        cfg = _load_yaml_config(config_path) if config_path else {}
+        def _g(k, default): return cfg.get(k, default)
 
-        # buffer for action target
-        self.action_target = dict[str, None](left_arm=None, right_arm=None, left_gripper=None, right_gripper=None)
+        urdf_left  = urdf_path_left  or _g("urdf_path_left",
+            "real_world/robot_api/assets/AM2_left/urdf/AM2_left.urdf")
+        urdf_right = urdf_path_right or _g("urdf_path_right",
+            "real_world/robot_api/assets/AM2_right/urdf/AM2_right.urdf")
+        # 方案 A: 默认固定从 base_link 起链，避免被 YAML 中旧配置意外覆盖。
+        # 如需特殊根链路，显式通过构造参数传入 base_link_left/right。
+        base_l = base_link_left
+        base_r = base_link_right
+        ee_l   = ee_link_left    if ee_link_left   != "left-link_tcp"  else _g("ee_link_left",  "left-link_tcp")
+        ee_r   = ee_link_right   if ee_link_right  != "right-link_tcp" else _g("ee_link_right", "right-link_tcp")
+        rtype  = _g("robot_type", robot_type)
+        vel    = vel_max if vel_max is not None else _g("vel_max", 0.08)
 
-        left_base_pos = [0, 0.116, 0]
-        right_base_pos = [0, -0.116, 0]
-        left_base_euler = [-np.pi/2, 0, 0]
-        right_base_euler = [np.pi/2, 0, 0]
+        # ── 选择底层 wrapper ──
+        if robot_wrapper is not None:
+            self.robot = robot_wrapper
+            self._robot_type = "typhon" if isinstance(robot_wrapper, RobotWrapperTyphon) else "eyou"
+        elif rtype == "typhon":
+            typhon_cfg = _g("typhon", {})
+            self.robot = RobotWrapperTyphon(
+                base_url=typhon_cfg.get("base_url", "http://192.168.100.100:8081"),
+                timeout=typhon_cfg.get("timeout", 5.0),
+                auto_enter_control_mode=typhon_cfg.get("auto_enter_control_mode", True),
+            )
+            self._robot_type = "typhon"
+        elif rtype == "eyou":
+            if not EYOU_AVAILABLE:
+                raise RuntimeError("rb_python not installed; eyou backend unavailable")
+            self.robot = RobotWrapperEyou(vel_max=vel)
+            self._robot_type = "eyou"
+        else:
+            raise ValueError(f"Unknown robot_type: {rtype}")
 
-        # arm base to robot base
-        self.ab2rb_left = np.eye(4)
-        self.ab2rb_left[:3, 3] = left_base_pos
-        self.ab2rb_left[:3, :3] = t3d.euler.euler2mat(*left_base_euler)
-        self.ab2rb_right = np.eye(4)
-        self.ab2rb_right[:3, 3] = right_base_pos
-        self.ab2rb_right[:3, :3] = t3d.euler.euler2mat(*right_base_euler)
+        # ── 命令缓冲 ──
+        self.action_target = dict(
+            left_arm=None, right_arm=None,
+            left_gripper=None, right_gripper=None,
+        )
 
-        # Preprocess URDF files to replace package:// URIs with relative paths
-        urdf_left_for_pykin, urdf_left_tmp = prepare_urdf_for_pykin(_resolve_repo_path(urdf_path_left))
-        urdf_right_for_pykin, urdf_right_tmp = prepare_urdf_for_pykin(_resolve_repo_path(urdf_path_right))
-        
-        # Store temp file paths for cleanup
-        self._temp_urdf_files = [urdf_left_tmp, urdf_right_tmp]
+        # ── pykin URDF 准备 ──
+        urdf_l_pykin, urdf_l_tmp = prepare_urdf_for_pykin(_resolve_repo_path(urdf_left))
+        urdf_r_pykin, urdf_r_tmp = prepare_urdf_for_pykin(_resolve_repo_path(urdf_right))
+        self._temp_urdf_files = [urdf_l_tmp, urdf_r_tmp]
 
-        #class for ik/fk
-        self.kin_left = SingleArm(urdf_left_for_pykin, t_utils.Transform(rot=t3d.euler.euler2quat(*left_base_euler), pos=self.ab2rb_left[:3, 3]))
-        self.kin_right = SingleArm(urdf_right_for_pykin, t_utils.Transform(rot=t3d.euler.euler2quat(*right_base_euler), pos=self.ab2rb_right[:3, 3]))
-        self.kin_left.setup_link_name("left-link_arm_base", "left-link_arm_7")
-        self.kin_right.setup_link_name("right-link_arm_base", "right-link_arm_7")
+        # ── pykin SingleArm (方案 A: 不传 ab2rb 偏移) ──
+        # 单臂 URDF 已经从 base_link 开始, JOINT_L00/R00 在 URDF 内部,
+        # pykin 加载后从 base_link 走到 tcp 自动包含所有偏移.
+        # SingleArm 第二个参数留单位变换, 表示 "URDF 根 = world 原点".
+        self.kin_left  = SingleArm(urdf_l_pykin)
+        self.kin_right = SingleArm(urdf_r_pykin)
 
-    def get_robot_joints(self) -> dict[str, np.ndarray]:
-        '''return joint angles of left and right arm, gripper width'''
-        joint_cur_left = np.array(self.robot.get_joint_angle("left_arm"))
-        joint_cur_right = np.array(self.robot.get_joint_angle("right_arm"))
+        self.kin_left.setup_link_name(base_l, ee_l)
+        self.kin_right.setup_link_name(base_r, ee_r)
 
-        gripper_cur_left = np.array(self.robot.get_joint_angle("left_gripper"))
-        gripper_cur_right = np.array(self.robot.get_joint_angle("right_gripper"))
-
-        robot_joints: dict[str, np.ndarray] = {
-            "left_arm": joint_cur_left,
-            "right_arm": joint_cur_right,
-            "left_gripper": gripper_cur_left,
-            "right_gripper": gripper_cur_right
+        # ── 关节限位 (从 URDF 抽取, 用于 set_target_JP 时 clip 防止超限) ──
+        self._joint_layout = {
+            "left_arm":  left_joint_names  or _g("left_joint_names",
+                [f"JOINT_L0{i}" for i in range(1, 8)]),
+            "right_arm": right_joint_names or _g("right_joint_names",
+                [f"JOINT_R0{i}" for i in range(1, 8)]),
         }
-        return robot_joints
-    
+        self._joint_limits = {
+            "left_arm":  self._extract_joint_limits(_resolve_repo_path(urdf_left),  self._joint_layout["left_arm"]),
+            "right_arm": self._extract_joint_limits(_resolve_repo_path(urdf_right), self._joint_layout["right_arm"]),
+        }
+
+        self._joint_shape_logged = False
+        print(f"[RobotControl] initialized "
+              f"(backend={self._robot_type}, base_link={base_l}, ee={ee_l})")
+
+    # ============================================================
+    # URDF 限位抽取
+    # ============================================================
+    @staticmethod
+    def _extract_joint_limits(urdf_path: str, joint_names: list[str]) -> list[tuple[float, float]]:
+        try:
+            tree = ET.parse(urdf_path)
+            root = tree.getroot()
+        except Exception as e:
+            print(f"[WARN] parse URDF for limits failed: {e}")
+            return [(-np.inf, np.inf) for _ in joint_names]
+
+        m: dict[str, tuple[float, float]] = {}
+        for j in root.findall("joint"):
+            jn = j.attrib.get("name")
+            jt = j.attrib.get("type", "")
+            if not jn or jt not in ("revolute", "prismatic"):
+                continue
+            lim = j.find("limit")
+            if lim is None:
+                continue
+            lo = lim.attrib.get("lower")
+            hi = lim.attrib.get("upper")
+            if lo is None or hi is None:
+                continue
+            try:
+                m[jn] = (float(lo), float(hi))
+            except ValueError:
+                pass
+
+        out = []
+        for n in joint_names:
+            if n in m:
+                out.append(m[n])
+            else:
+                print(f"[WARN] no limit for {n}, using unbounded")
+                out.append((-np.inf, np.inf))
+        return out
+
+    def sanitize_joint_targets(self, arm_name: str, joints, strategy: str = "clip"):
+        """clip 关节目标到限位内. strategy='skip' 时超限返回 None."""
+        arr = np.asarray(joints, dtype=float).copy()
+        limits = self._joint_limits.get(arm_name, [])
+        if len(arr) != len(limits):
+            return arr.tolist()
+
+        exceeded = False
+        for i, (lo, hi) in enumerate(limits):
+            if np.isfinite(lo) and arr[i] < lo:
+                exceeded = True
+                if strategy == "clip":
+                    print(f"[WARN] {arm_name}[{i}] {arr[i]:.4f} < {lo:.4f}, clipped")
+                    arr[i] = lo
+            if np.isfinite(hi) and arr[i] > hi:
+                exceeded = True
+                if strategy == "clip":
+                    print(f"[WARN] {arm_name}[{i}] {arr[i]:.4f} > {hi:.4f}, clipped")
+                    arr[i] = hi
+
+        if exceeded and strategy == "skip":
+            return None
+        return arr.tolist()
+
+    # ============================================================
+    # 主接口
+    # ============================================================
+    def get_robot_joints(self) -> dict[str, list[float]]:
+        out = {
+            "left_arm":      np.asarray(self.robot.get_joint_angle("left_arm"),     dtype=float).tolist(),
+            "right_arm":     np.asarray(self.robot.get_joint_angle("right_arm"),    dtype=float).tolist(),
+            "left_gripper":  np.asarray(self.robot.get_joint_angle("left_gripper"), dtype=float).tolist(),
+            "right_gripper": np.asarray(self.robot.get_joint_angle("right_gripper"),dtype=float).tolist(),
+        }
+        if not self._joint_shape_logged:
+            print("[INFO] get_robot_joints structure (logged once):")
+            for k, v in out.items():
+                print(f"  {k}: len={len(v)}")
+            self._joint_shape_logged = True
+        return out
 
     def get_ee_pose(self) -> dict[str, np.ndarray]:
-        '''return ee pose of left and right arm, gripper width'''
-        
-        robot_joints = self.get_robot_joints()
+        """
+        返回左右臂 ee 在 base 系下的位姿.
 
-        fk_left = self.kin_left.forward_kin(robot_joints["left_arm"])
-        fk_right = self.kin_right.forward_kin(robot_joints["right_arm"])
+        方案 A 下 pykin FK 链从 base_link 开始, JOINT_L00/R00 包含在内,
+        compute_eef_pose 输出就是 ^rbT_eef, 直接返回, 不做任何额外变换.
 
-        ee2rb_pose_left = self.kin_left.compute_eef_pose(fk_left)
-        ee2rb_pose_right = self.kin_right.compute_eef_pose(fk_right)
+        格式: 7-vector [x, y, z, qw, qx, qy, qz]  (scalar-first 四元数)
+        """
+        joints = self.get_robot_joints()
 
-        ee_pose: dict[str, np.ndarray] = {
-            "left_arm_ee2rb": ee2rb_pose_left,
-            "right_arm_ee2rb": ee2rb_pose_right,
-            "left_gripper": robot_joints["left_gripper"],
-            "right_gripper": robot_joints["right_gripper"],
+        fk_l = self.kin_left.forward_kin(np.asarray(joints["left_arm"],  dtype=float))
+        fk_r = self.kin_right.forward_kin(np.asarray(joints["right_arm"], dtype=float))
+
+        ee_l = self.kin_left.compute_eef_pose(fk_l)
+        ee_r = self.kin_right.compute_eef_pose(fk_r)
+
+        return {
+            "left_arm_ee2rb":  np.asarray(ee_l, dtype=float),
+            "right_arm_ee2rb": np.asarray(ee_r, dtype=float),
+            "left_gripper":  joints["left_gripper"],
+            "right_gripper": joints["right_gripper"],
         }
 
-        return ee_pose
-
-
-    def set_target_JP(self, joint_left:np.ndarray, joint_right:np.ndarray=None, gripper_left:np.ndarray=None, gripper_right:np.ndarray=None):
-        """
-        Set target joint positions for bimanual or single arm robot.
-        
-        Args:
-            joint_left: Left arm joint angles
-            joint_right: Right arm joint angles (None for single arm mode)
-            gripper_left: Left gripper position
-            gripper_right: Right gripper position (None for single arm mode)
-        """
-        self.action_target["left_arm"] = joint_left
+    def set_target_JP(
+        self,
+        joint_left: np.ndarray,
+        joint_right: np.ndarray = None,
+        gripper_left: np.ndarray = None,
+        gripper_right: np.ndarray = None,
+    ):
+        """关节空间目标设置. 自动 clip 到关节限位."""
+        safe_l = self.sanitize_joint_targets("left_arm", joint_left, "clip")
+        self.action_target["left_arm"] = safe_l if safe_l is not None else list(joint_left)
         self.action_target["left_gripper"] = gripper_left
-        
-        # Only set right arm if provided (bimanual mode)
+
         if joint_right is not None:
-            self.action_target["right_arm"] = joint_right
+            safe_r = self.sanitize_joint_targets("right_arm", joint_right, "clip")
+            self.action_target["right_arm"] = safe_r if safe_r is not None else list(joint_right)
         if gripper_right is not None:
             self.action_target["right_gripper"] = gripper_right
 
-    def _inverse_kin_silent(self, kin_solver: SingleArm, current_joints: np.ndarray, target_pose: np.ndarray) -> np.ndarray:
-        # pykin 的 IK 内部会 print 迭代日志，这里静默以避免刷屏。
-        with contextlib.redirect_stdout(io.StringIO()):
-            return kin_solver.inverse_kin(current_joints, target_pose, method="LM", max_iter=100)
+    def set_target_CP(self, target_pose: dict, single_arm_mode: bool = False):
+        """
+        笛卡尔空间目标设置.
 
+        target_pose 里的 *_ee2rb 都是 ^rbT_eef (与 get_ee_pose 输出格式一致).
+        方案 A 下 pykin IK 期望的也是 ^rbT_eef, 直接传入.
+        """
+        joints = self.get_robot_joints()
 
-    def set_target_CP(self, target_pose:dict[str, np.ndarray], single_arm_mode:bool=False):
-        
-        # get current joints
-        robot_joints: dict[str, np.ndarray] = self.get_robot_joints()
+        # 左臂
+        target_l = target_pose["left_arm_ee2rb"]
+        joints_l = self._inverse_kin_silent(self.kin_left, joints["left_arm"], target_l)
 
-        # Always compute left arm IK
-        ee2ab_target_pose_left = target_pose["left_arm_ee2rb"]
-        # quat in pykin is w x y z !!!
-        joints_left: np.ndarray = self._inverse_kin_silent(self.kin_left, robot_joints["left_arm"], ee2ab_target_pose_left)
-        
         if single_arm_mode:
-            # Single arm mode - only set left arm, don't update right arm action_target
-            self.action_target["left_arm"] = joints_left
-            self.action_target["left_gripper"] = target_pose["left_gripper"]
-            # Don't modify right arm targets - they remain None or previous value
+            self.action_target["left_arm"] = joints_l
+            self.action_target["left_gripper"] = target_pose.get("left_gripper")
         else:
-            # Bimanual mode - set both arms
-            ee2ab_target_pose_right = target_pose["right_arm_ee2rb"]
-            joints_right: np.ndarray = self._inverse_kin_silent(self.kin_right, robot_joints["right_arm"], ee2ab_target_pose_right)
-            self.set_target_JP(joints_left, joints_right, target_pose["left_gripper"], target_pose["right_gripper"])
+            target_r = target_pose["right_arm_ee2rb"]
+            joints_r = self._inverse_kin_silent(self.kin_right, joints["right_arm"], target_r)
+            self.set_target_JP(
+                joints_l, joints_r,
+                target_pose.get("left_gripper"),
+                target_pose.get("right_gripper"),
+            )
 
+    @staticmethod
+    def _inverse_kin_silent(kin: SingleArm, current_joints, target):
+        """静默版 IK, 屏蔽 pykin 的迭代日志."""
+        with contextlib.redirect_stdout(io.StringIO()):
+            return kin.inverse_kin(np.asarray(current_joints, dtype=float),
+                                   target, method="LM", max_iter=100)
 
     def execute(self):
-        for component_name, target_joints in self.action_target.items():
-            if target_joints is not None:
-                self.robot.set_joint_angle(component_name, target_joints)
-
+        for name, joints in self.action_target.items():
+            if joints is not None:
+                self.robot.set_joint_angle(name, joints)
 
     def stop(self):
-        self.robot._robot.shutdown()
+        if hasattr(self.robot, "_robot") and hasattr(self.robot._robot, "shutdown"):
+            self.robot._robot.shutdown()
         self._cleanup_temp_files()
-    
+
     def _cleanup_temp_files(self):
-        """Clean up temporary URDF files"""
-        if hasattr(self, '_temp_urdf_files'):
-            for temp_file in self._temp_urdf_files:
-                try:
-                    if os.path.exists(temp_file):
-                        os.remove(temp_file)
-                except Exception:
-                    pass  # Ignore errors during cleanup
-    
+        for f in getattr(self, "_temp_urdf_files", []):
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+            except Exception:
+                pass
+
     def __del__(self):
-        """Cleanup when object is destroyed"""
         self._cleanup_temp_files()
 
 
+# ============================================================
+# 自测
+# ============================================================
 if __name__ == "__main__":
     np.set_printoptions(precision=4, suppress=True)
-    robot = RobotControl(vel_max=0.08)
+    rc = RobotControl(vel_max=0.08)
 
-    # get current joints
-    # curr_joints = robot.get_robot_joints()
-    # print(curr_joints)
+    print("\n=== Joints ===")
+    js = rc.get_robot_joints()
+    for k, v in js.items():
+        print(f"  {k}: {np.round(v, 4)}")
 
-    save_dir = "real_world/robot_api"
-    save_path = os.path.join(save_dir, f"saved_poses.npy")
-    os.makedirs(save_dir, exist_ok=True)
+    print("\n=== EE Pose ===")
+    ee = rc.get_ee_pose()
+    for k in ["left_arm_ee2rb", "right_arm_ee2rb"]:
+        v = ee[k]
+        print(f"  {k}:")
+        print(f"    pos:  {np.round(v[:3], 4)}")
+        print(f"    quat: {np.round(v[3:], 4)} (wxyz)")
+        print(f"    ||quat||: {np.linalg.norm(v[3:]):.6f}")
+        print(f"    distance from base: {np.linalg.norm(v[:3]):.4f} m")
 
-    curr_ee_pose = robot.get_ee_pose()
+    print("\n=== IK ↔ FK self-consistency ===")
+    target = ee["left_arm_ee2rb"].copy()
+    js_before = np.asarray(js["left_arm"], dtype=float)
 
+    rc.set_target_CP({
+        "left_arm_ee2rb":  target,
+        "right_arm_ee2rb": ee["right_arm_ee2rb"],
+        "left_gripper":  js["left_gripper"],
+        "right_gripper": js["right_gripper"],
+    })
+    js_solved = np.asarray(rc.action_target["left_arm"], dtype=float)
+    diff = js_solved - js_before
 
-    # If file exists, append to list; else, create new list
-    if os.path.exists(save_path):
-        existing_data = np.load(save_path, allow_pickle=True)
-        if isinstance(existing_data, np.ndarray) and len(existing_data.shape) == 0:
-            saved_list = [existing_data.item()]
-        else:
-            saved_list = list(existing_data)
-        saved_list.append(curr_ee_pose)
+    print(f"  current joints: {np.round(js_before, 4)}")
+    print(f"  IK solved:      {np.round(js_solved, 4)}")
+    print(f"  max abs diff:   {np.max(np.abs(diff)):.6f} rad")
+
+    if np.max(np.abs(diff)) < 0.001:
+        print("  ✓ IK ↔ FK 自洽")
     else:
-        saved_list = [curr_ee_pose]
-
-    print("current ee pose:", curr_ee_pose)
-    np.save(save_path, saved_list)
-    print(f"Saved current pose data to {save_path}")
+        print("  ✗ FAILED — IK 和 FK 坐标系约定不一致")

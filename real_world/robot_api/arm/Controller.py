@@ -12,9 +12,9 @@ from multiprocessing.managers import SharedMemoryManager
 import numpy as np
 # from scipy.spatial.transform import Rotation
 
-from utils.shared_memory.shared_memory_queue import (
+from policy.shared_memory.shared_memory_queue import (
     SharedMemoryQueue, Empty)
-from utils.shared_memory.shared_memory_ring_buffer import SharedMemoryRingBuffer
+from policy.shared_memory.shared_memory_ring_buffer import SharedMemoryRingBuffer
 from real_world.robot_api.arm.RobotControl_pykin import RobotControl
 
 from utils.pose_trajectory_interpolator import PoseTrajectoryInterpolator
@@ -273,7 +273,6 @@ class Controller(mp.Process):
             keep_running = True
             cmd_pose = None
             gc_interval = self.frequency  # collect once per second
-            last_late_action_log_time = 0.0
             gc.disable()
 
             while keep_running:
@@ -393,14 +392,10 @@ class Controller(mp.Process):
                         curr_time = t_now + dt_controller
 
                         if target_time <= curr_time:
-                            if t_now - last_late_action_log_time >= 2.0:
-                                print("[controller] action is too late")
-                                last_late_action_log_time = t_now
-                            pass
+                            print("[controller] action is too late")
                         else:
-                            # print("[controller] target_time, curr_time:", target_time, curr_time)
-                            # print("[controller] time :", target_time - curr_time)
-                            pass
+                            print("[controller] target_time, curr_time:", target_time, curr_time)
+                            print("[controller] time :", target_time - curr_time)
 
                         # Interpolator: If the target time is behind the current time, no action is executed
                         pose_interp_left = pose_interp_left.schedule_waypoint(
@@ -432,7 +427,7 @@ class Controller(mp.Process):
                 if time.monotonic() < t_cycle_end:
                     precise_wait(t_cycle_end)
                 else:
-                    # print("[controller] loop speed error, please slow down the controller frequency")
+                    print("[controller] loop speed error, please slow down the controller frequency")
                     t_start = time.monotonic() - (iter_idx + 1) * dt_controller
 
                 # first loop successful, ready to receive command

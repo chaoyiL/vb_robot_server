@@ -201,8 +201,8 @@ class ObsSaver:
 @click.option('--quest_2_ee_left', default=None, help="-") # eye-hand transform matrix
 @click.option('--quest_2_ee_right', default=None, help="-") # eye-hand transform matrix
 # @click.option('--width_slope', default=1.053562, type=float, help="-") # transform between gripper width and commanded width
-@click.option('--width_slope', default=2.041300, type=float, help="-") # transform between gripper width and commanded width
-@click.option('--width_offset', default=0.110115, type=float, help="-") # transform between gripper width and commanded width
+@click.option('--width_slope', default=1.77, type=float, help="-") # transform between gripper width and commanded width
+@click.option('--width_offset', default=0.044, type=float, help="-") # transform between gripper width and commanded width
 @click.option('--vel_max', default=0.4, type=float, help="-") # max velocity of robot
 
 @click.option('--obs_pose_repr', default='relative', help='obs pose representation')
